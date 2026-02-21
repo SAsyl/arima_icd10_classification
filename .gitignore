@@ -223,6 +223,7 @@ chroma_db/
 *.zip
 test*
 TaskQazCode
+*.db
 
 # Readme files
 *.md
