@@ -10,7 +10,12 @@ import sys
 from typing import List, Dict, Any, Optional
 import chromadb
 from chromadb.config import Settings
-from protocol_processor_fixed import ProtocolEmbeddingFunction
+from parse_protocols import ProtocolEmbeddingFunction
+import torch
+import numpy as np
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import sqlite3
+import json
 
 # Set up logging
 logging.basicConfig(
@@ -18,6 +23,121 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+class ProtocolReranker:
+    """Custom reranking function for protocols using a cross-encoder."""
+    
+    def __init__(self, model_name: str = "Qwen/Qwen3-Reranker-0.6B", max_length: int = 2048):
+        self.model_name = model_name
+        self.max_length = max_length
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        # Try to load on GPU first, check for Apple Silicon, fallback to CPU
+        if torch.cuda.is_available():
+            self.device = "cuda"
+        elif torch.backends.mps.is_available():
+            self.device = "mps"
+        else:
+            self.device = "cpu"
+            
+        try:
+            # Load Model in float16 for 4GB VRAM safety.
+            self.model = AutoModelForSequenceClassification.from_pretrained(
+                model_name,
+                num_labels=1,
+                torch_dtype=torch.float16
+            )
+            
+            if self.device == "cuda":
+                try:
+                    self.model.to(self.device)
+                    logger.info(f"Loaded reranker model {model_name} on {self.device}")
+                except torch.cuda.OutOfMemoryError:
+                    logger.warning(f"GPU out of memory, falling back to CPU for {model_name}")
+                    self.device = "cpu"
+                    self.model.to(self.device)
+                    self.model.float() # Float32 is safer/faster for CPU inference
+                    logger.info(f"Loaded reranker model {model_name} on {self.device}")
+            else:
+                self.model.to(self.device)
+                if self.device == "cpu":
+                    self.model.float() 
+                logger.info(f"Loaded reranker model {model_name} on {self.device}")
+                
+            # Set model to evaluation mode
+            self.model.eval()
+            
+        except Exception as e:
+            logger.error(f"Failed to load model {model_name}: {e}")
+            raise
+
+    def rerank(self, query_text: str, initial_results: Dict[str, Any], top_k: int = 3) -> List[Dict[str, Any]]:
+        """
+        Takes the initial results from ChromaDB and reranks them using a Cross-Encoder.
+        Processes one pair at a time to prevent VRAM overflow.
+        """
+        if not initial_results or not initial_results.get('ids') or not initial_results['ids'][0]:
+            logger.warning("No results to rerank.")
+            return []
+
+        # Extract data from Chroma's dictionary output
+        docs = initial_results['documents'][0]
+        metadatas = initial_results['metadatas'][0]
+        ids = initial_results['ids'][0]
+        distances = initial_results['distances'][0]
+
+        scores = []
+        logger.info("Calculating Cross-Encoder scores...")
+        
+        # Process one Query-Document pair at a time (Batch Size = 1)
+        with torch.no_grad():
+            for doc in docs:
+                # Tokenize pair
+                inputs = self.tokenizer(
+                    query_text,
+                    doc,
+                    padding=True,
+                    truncation=True,
+                    max_length=self.max_length, 
+                    return_tensors="pt"
+                ).to(self.device)
+                
+                # Predict
+                output = self.model(**inputs)
+                
+                # Extract the raw logit score
+                score = float(output.logits.squeeze())
+                scores.append(score)
+                
+                # Aggressive memory clearing for 4GB VRAM
+                if self.device == "cuda":
+                    torch.cuda.empty_cache()
+
+        # Sort by Cross-Encoder score in descending order
+        scores_array = np.array(scores)
+        ranked_indices = np.argsort(scores_array)[::-1]
+
+        reranked_output = []
+        
+        # Format the final top_k results
+        for i, idx in enumerate(ranked_indices[:top_k]):
+            doc_id = ids[idx]
+            score = scores[idx]
+            original_dist = distances[idx]
+            metadata = metadatas[idx]
+            document = docs[idx]
+            
+            logger.debug(f"Rank {i+1}: Chunk ID {doc_id} | Score: {score:.4f}")
+            
+            reranked_output.append({
+                "id": doc_id,
+                "document": document,
+                "metadata": metadata,
+                "rerank_score": score,
+                "original_distance": original_dist
+            })
+            
+        return reranked_output
 
 
 class ProtocolSearcher:
@@ -27,7 +147,8 @@ class ProtocolSearcher:
         self,
         chroma_persist_directory: str = "./chroma_db",
         collection_name: str = "medical_protocols",
-        embedding_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+        embedding_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        sqlite_db_path: str = "protocols.db"
     ):
         """
         Initialize the protocol searcher.
@@ -39,9 +160,11 @@ class ProtocolSearcher:
         """
         self.chroma_persist_directory = chroma_persist_directory
         self.collection_name = collection_name
+        self.sqlite_db_path = sqlite_db_path
         
         # Initialize embedding function
         self.embedding_function = ProtocolEmbeddingFunction(embedding_model_name)
+        self.reranker = ProtocolReranker()
         
         # Initialize ChromaDB client
         self.client = chromadb.PersistentClient(path=chroma_persist_directory)
@@ -56,12 +179,122 @@ class ProtocolSearcher:
             logger.error(f"Failed to connect to collection '{collection_name}': {e}")
             sys.exit(1)
     
+    def index_full_protocols_to_sqlite(self, jsonl_file: str):
+        """
+        Reads the original JSONL file and stores the full documents in SQLite 
+        for instant retrieval by protocol_id.
+        """
+        logger.info(f"Indexing full protocols into SQLite DB: {self.sqlite_db_path}")
+        conn = sqlite3.connect(self.sqlite_db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS protocols (
+                protocol_id TEXT PRIMARY KEY,
+                source_file TEXT,
+                title TEXT,
+                data JSON
+            )
+        ''')
+        
+        count = 0
+        with open(jsonl_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                obj = json.loads(line)
+                protocol_id = obj.get('protocol_id')
+                
+                if protocol_id:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO protocols (protocol_id, source_file, title, data)
+                        VALUES (?, ?, ?, ?)
+                    ''', (
+                        protocol_id, 
+                        obj.get('source_file'), 
+                        obj.get('title'), 
+                        json.dumps(obj)
+                    ))
+                    count += 1
+        
+        conn.commit()
+        conn.close()
+        logger.info(f"Successfully indexed {count} protocols into SQLite.")
+
+    def get_full_protocol(self, protocol_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Instantly fetch the full original protocol JSON from SQLite.
+        """
+        conn = sqlite3.connect(self.sqlite_db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT data FROM protocols WHERE protocol_id = ?", (protocol_id,))
+        row = cursor.fetchone()
+        conn.close()
+        
+        if row:
+            return json.loads(row[0])
+        else:
+            logger.warning(f"Protocol ID '{protocol_id}' not found in SQLite.")
+            return None
+
+    def advanced_search(self, query: str, instruction: str = "Given a medical query, find relevant protocol chunks: ", top_k_chunks: int = 15, final_top_protocols: int = 3) -> List[Dict[str, Any]]:
+        """
+        The complete pipeline: 
+        1. Chroma Search -> 2. Qwen Rerank -> 3. Max Pooling -> 4. SQLite Full Fetch
+        """
+        # Step 1: Broad search in ChromaDB
+        initial_results = self.search(
+            query=query, 
+            n_results=top_k_chunks, 
+            instruction=instruction
+        )
+        
+        if not initial_results['ids'][0]:
+            return []
+
+        # Step 2: Deep reranking with Cross-Encoder
+        reranked_chunks = self.reranker.rerank(
+            query_text=query, 
+            initial_results=initial_results, 
+            top_k=top_k_chunks # Rerank all of them to find the true best
+        )
+
+        # Step 3: Max Pooling (Get the highest scoring chunk per protocol_id)
+        protocol_dict = {}
+        for chunk in reranked_chunks:
+            pid = chunk['metadata'].get('protocol_id')
+            score = chunk['rerank_score']
+            
+            if pid and (pid not in protocol_dict or score > protocol_dict[pid]['best_score']):
+                protocol_dict[pid] = {
+                    'protocol_id': pid,
+                    'best_score': score,
+                    'winning_chunk': chunk['document']
+                }
+
+        # Sort protocols by their best chunk's score
+        ranked_pids = sorted(list(protocol_dict.values()), key=lambda x: x['best_score'], reverse=True)
+        
+        # Step 4: Fetch full data from SQLite for the top N protocols
+        final_output = []
+        for p in ranked_pids[:final_top_protocols]:
+            full_data = self.get_full_protocol(p['protocol_id'])
+            if full_data:
+                final_output.append({
+                    "protocol_id": p['protocol_id'],
+                    "rerank_score": p['best_score'],
+                    "winning_chunk_snippet": p['winning_chunk'][:200] + "...",
+                    "full_protocol_data": full_data # The complete JSON from SQLite!
+                })
+
+        return final_output
+
     def search(
         self,
         query: str,
         n_results: int = 5,
         where: Optional[Dict[str, Any]] = None,
-        where_document: Optional[Dict[str, Any]] = None
+        where_document: Optional[Dict[str, Any]] = None,
+        instruction: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Search for relevant protocol chunks.
@@ -79,7 +312,7 @@ class ProtocolSearcher:
         
         try:
             results = self.collection.query(
-                query_texts=[query],
+                query_texts=[instruction + query],
                 n_results=n_results,
                 where=where,
                 where_document=where_document
@@ -193,8 +426,8 @@ class ProtocolSearcher:
             print(f"Chunk: {metadata.get('chunk_number', 'N/A')} of {metadata.get('total_chunks', 'N/A')}")
             print(f"ICD Codes: {metadata.get('icd_codes_str', 'N/A')}")
             print(f"\nContent:")
-            # print(document[:500] + "..." if len(document) > 500 else document)
-            print(len(document), document)
+            print(document[:500] + "..." if len(document) > 500 else document)
+            # print(len(document), document)
     
     def print_protocol_chunks(self, protocol_id: str, results: Dict[str, Any]) -> None:
         """
@@ -302,6 +535,12 @@ Examples:
         default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
         help="Name of the embedding model (default: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2)"
     )
+
+    parser.add_argument(
+        "--query-instruction",
+        default="Given a search query, retrieve relevant passages that answer the query: ",
+        help="Instruction to paste before query"
+    )
     
     args = parser.parse_args()
     
@@ -309,9 +548,12 @@ Examples:
     searcher = ProtocolSearcher(
         chroma_persist_directory=args.db_dir,
         collection_name=args.collection_name,
-        embedding_model_name=args.embedding_model
+        embedding_model_name=args.embedding_model,
+        sqlite_db_path="protocols.db"
     )
     
+    searcher.index_full_protocols_to_sqlite("TaskQazCode/protocols_corpus.jsonl")
+
     # Handle different operations
     if args.list_protocols:
         protocols = searcher.list_protocols()
@@ -327,15 +569,22 @@ Examples:
         # Prepare where clause if protocol ID is specified
         where_clause = {'protocol_id': args.protocol_id} if args.protocol_id else None
         
-        # Perform search
-        results = searcher.search(
-            query=args.query,
-            n_results=args.n_results,
-            where=where_clause
-        )
+        # # Perform search
+        # results = searcher.search(
+        #     query=args.query,
+        #     n_results=args.n_results,
+        #     where=where_clause,
+        #     instruction=args.query_instruction
+        # )
         
-        # Print results
-        searcher.print_search_results(results, args.query)
+
+        # # Print results
+        # searcher.print_search_results(results, args.query)
+
+        # This will return a clean list of the top 3 FULL protocols, ranked accurately!
+        best_protocols = searcher.advanced_search(args.query)
+
+        print(best_protocols)
     
     else:
         parser.print_help()
