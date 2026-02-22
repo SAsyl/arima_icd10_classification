@@ -13,7 +13,7 @@ from chromadb.config import Settings
 from parse_protocols import ProtocolEmbeddingFunction
 import torch
 import numpy as np
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModelForCausalLM
 import sqlite3
 import json
 
@@ -30,46 +30,28 @@ class ProtocolReranker:
     def __init__(self, model_name: str = "Qwen/Qwen3-Reranker-0.6B", max_length: int = 512):
         self.model_name = model_name
         self.max_length = max_length
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side='left')
         
-        # Try to load on GPU first, check for Apple Silicon, fallback to CPU
-        if torch.cuda.is_available():
-            self.device = "cuda"
-        elif torch.backends.mps.is_available():
-            self.device = "mps"
-        else:
-            self.device = "cpu"
-            
-        try:
-            # Load Model in float16 for 4GB VRAM safety.
-            self.model = AutoModelForSequenceClassification.from_pretrained(
-                model_name,
-                num_labels=1,
-                torch_dtype=torch.float16
-            )
-            
-            if self.device == "cuda":
-                try:
-                    self.model.to(self.device)
-                    logger.info(f"Loaded reranker model {model_name} on {self.device}")
-                except torch.cuda.OutOfMemoryError:
-                    logger.warning(f"GPU out of memory, falling back to CPU for {model_name}")
-                    self.device = "cpu"
-                    self.model.to(self.device)
-                    self.model.float() # Float32 is safer/faster for CPU inference
-                    logger.info(f"Loaded reranker model {model_name} on {self.device}")
-            else:
-                self.model.to(self.device)
-                if self.device == "cpu":
-                    self.model.float() 
-                logger.info(f"Loaded reranker model {model_name} on {self.device}")
-                
-            # Set model to evaluation mode
-            self.model.eval()
-            
-        except Exception as e:
-            logger.error(f"Failed to load model {model_name}: {e}")
-            raise
+        # Load as CausalLM (Generative) instead of SequenceClassification
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            torch_dtype=torch.float16,
+            device_map="auto" # Handles the GPU/CPU/MPS logic automatically
+        ).eval()
+
+        # Pre-cache the token IDs for "yes" and "no"
+        self.token_yes_id = self.tokenizer.convert_tokens_to_ids("yes")
+        self.token_no_id = self.tokenizer.convert_tokens_to_ids("no")
+
+        # Template components
+        self.prefix = "<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n<|im_start|>user\n"
+        self.suffix = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        self.instruction = "Given a protocol query, retrieve relevant technical sections that answer the query."
+
+    def _format_input(self, query: str, doc: str):
+        content = f"<Instruct>: {self.instruction}\n<Query>: {query}\n<Document>: {doc}"
+        full_prompt = f"{self.prefix}{content}{self.suffix}"
+        return full_prompt
 
     def rerank(self, query_text: str, initial_results: Dict[str, Any], top_k: int = 3) -> List[Dict[str, Any]]:
         """
@@ -89,29 +71,22 @@ class ProtocolReranker:
         scores = []
         logger.info("Calculating Cross-Encoder scores...")
         
-        # Process one Query-Document pair at a time (Batch Size = 1)
+        scores = []
         with torch.no_grad():
             for doc in docs:
-                # Tokenize pair
-                inputs = self.tokenizer(
-                    query_text,
-                    doc,
-                    padding=True,
-                    truncation=True,
-                    max_length=self.max_length, 
-                    return_tensors="pt"
-                ).to(self.device)
+                prompt = self._format_input(query_text, doc)
+                inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
                 
-                # Predict
-                output = self.model(**inputs)
+                # Get logits for the very last token generated
+                logits = self.model(**inputs).logits[:, -1, :]
                 
-                # Extract the raw logit score
-                score = float(output.logits.squeeze())
+                # Isolate "yes" vs "no"
+                relevant_logits = torch.stack([logits[:, self.token_no_id], logits[:, self.token_yes_id]], dim=1)
+                probs = torch.softmax(relevant_logits, dim=1)
+                
+                # The score is the probability of "yes" (index 1)
+                score = probs[0, 1].item()
                 scores.append(score)
-                
-                # Aggressive memory clearing for 4GB VRAM
-                if self.device == "cuda":
-                    torch.cuda.empty_cache()
 
         # Sort by Cross-Encoder score in descending order
         scores_array = np.array(scores)
@@ -236,7 +211,7 @@ class ProtocolSearcher:
             logger.warning(f"Protocol ID '{protocol_id}' not found in SQLite.")
             return None
 
-    def advanced_search(self, query: str, instruction: str = "Given a medical query, find relevant protocol chunks: ", top_k_chunks: int = 15, final_top_protocols: int = 3) -> List[Dict[str, Any]]:
+    def advanced_search(self, query: str, instruction: str = "Given a medical query, find relevant protocol chunks: ", top_k_chunks: int = 50, final_top_protocols: int = 3) -> List[Dict[str, Any]]:
         """
         The complete pipeline: 
         1. Chroma Search -> 2. Qwen Rerank -> 3. Max Pooling -> 4. SQLite Full Fetch
@@ -625,6 +600,54 @@ class ProtocolSearcher:
             print(document)
 
 
+    def print_advanced_search_results(self, query: str, results: List[Dict[str, Any]]) -> None:
+        """
+        Print the fully ranked protocol results in a readable terminal format.
+        
+        Args:
+            query: The original search query
+            results: The list of dictionaries returned by advanced_search()
+        """
+        print(f"\n{'='*80}")
+        print(f"ADVANCED SEARCH RESULTS FOR: '{query}'")
+        print(f"{'='*80}")
+        
+        if not results:
+            print("No protocols found.")
+            return
+        
+        for i, result in enumerate(results):
+            protocol_id = result.get('protocol_id', 'Unknown ID')
+            score = result.get('rerank_score', 0.0)
+            snippet = result.get('winning_chunk_snippet', '')
+            
+            # Extract the full document data fetched from SQLite
+            full_data = result.get('full_protocol_data', {})
+            source_file = full_data.get('source_file', 'N/A')
+            title = full_data.get('title', 'N/A')
+            
+            # ICD codes might be a list or a string depending on your JSON structure
+            icd_codes = full_data.get('icd_codes', 'N/A')
+            if isinstance(icd_codes, list):
+                icd_codes = ", ".join(icd_codes) if icd_codes else "None"
+                
+            full_text = full_data.get('text', '')
+            
+            print(f"\nRANK {i+1} | Score: {score:.4f} | Protocol: {protocol_id}")
+            print(f"{'-'*80}")
+            print(f"Source File : {source_file}")
+            print(f"Title       : {title}")
+            print(f"ICD Codes   : {icd_codes}")
+            
+            print(f"\n>> BEST MATCHING SNIPPET (Why this protocol was chosen):")
+            print(f"{snippet}")
+            
+            print(f"\n>> FULL PROTOCOL TEXT PREVIEW (First 300 chars...):")
+            # Print just the beginning of the full text so it doesn't flood your terminal
+            preview_text = full_text[:300].replace('\n', ' ')
+            print(f"{preview_text}...")
+            print(f"{'-'*80}")
+
 def main():
     """Main function to handle command line arguments and run the search."""
     parser = argparse.ArgumentParser(
@@ -769,10 +792,10 @@ Examples:
         # # Print results
         # searcher.print_search_results(results, args.query)
 
-        # This will return a clean list of the top 3 FULL protocols, ranked accurately!
+        # # This will return a clean list of the top 3 FULL protocols, ranked accurately!
         best_protocols = searcher.advanced_search(args.query)
 
-        print(best_protocols)
+        searcher.print_advanced_search_results(args.query, best_protocols)
     
     else:
         parser.print_help()
