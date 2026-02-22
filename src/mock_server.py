@@ -595,7 +595,7 @@ class DiagnosticEngine:
 
         async def process_one(
             protocol: ProtocolContext,
-        ) -> tuple[ProtocolContext, ProtocolCandidate]:
+        ) -> tuple[ProtocolContext, Optional[ProtocolCandidate]]:
             async with semaphore:
                 try:
                     candidate = await self._generate_protocol_candidate(
@@ -608,15 +608,24 @@ class DiagnosticEngine:
                         protocol.protocol_id,
                         err,
                     )
-                    return protocol, self._fallback_candidate(protocol, str(err))
+                    return protocol, None
 
         generated = await asyncio.gather(*[process_one(context) for context in contexts])
         generated_sorted = sorted(generated, key=lambda row: row[0].retrieval_rank)
+        real_generated = [
+            (protocol, candidate)
+            for protocol, candidate in generated_sorted
+            if candidate is not None
+        ]
 
-        max_rank_index = max(len(generated_sorted) - 1, 1)
+        if not real_generated:
+            logger.warning("No real model candidates were generated for this request")
+            return DiagnoseResponse(diagnoses=[])
+
+        max_rank_index = max(len(real_generated) - 1, 1)
         best_by_code: dict[str, tuple[float, ProtocolCandidate]] = {}
 
-        for idx, (protocol, candidate) in enumerate(generated_sorted):
+        for idx, (protocol, candidate) in enumerate(real_generated):
             retrieval_score = 1.0 - (idx / max_rank_index)
             score = 0.6 * retrieval_score + 0.4 * candidate.confidence
             code_norm = _normalize_code(candidate.icd10_code)
@@ -636,45 +645,6 @@ class DiagnosticEngine:
                     explanation=candidate.explanation,
                 )
             )
-
-        if len(diagnoses) < 3:
-            used_codes = {_normalize_code(item.icd10_code) for item in diagnoses}
-            for protocol in contexts:
-                for code in protocol.allowed_codes:
-                    code_norm = _normalize_code(code)
-                    if code_norm in used_codes:
-                        continue
-                    diagnoses.append(
-                        Diagnosis(
-                            rank=len(diagnoses) + 1,
-                            diagnosis=protocol.title or "Резервный диагноз",
-                            icd10_code=code,
-                            explanation=(
-                                f"Резервное дополнение из protocol_id={protocol.protocol_id}."
-                            ),
-                        )
-                    )
-                    used_codes.add(code_norm)
-                    if len(diagnoses) == 3:
-                        break
-                if len(diagnoses) == 3:
-                    break
-
-        if len(diagnoses) < 3:
-            for code in DEFAULT_FALLBACK_CODES:
-                code_norm = _normalize_code(code)
-                if any(_normalize_code(item.icd10_code) == code_norm for item in diagnoses):
-                    continue
-                diagnoses.append(
-                    Diagnosis(
-                        rank=len(diagnoses) + 1,
-                        diagnosis="Резервный диагноз",
-                        icd10_code=code,
-                        explanation="Недостаточно данных в retrieval-контексте.",
-                    )
-                )
-                if len(diagnoses) == 3:
-                    break
 
         return DiagnoseResponse(diagnoses=diagnoses)
 
