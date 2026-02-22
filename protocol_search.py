@@ -123,7 +123,9 @@ class ProtocolSearcher:
         chroma_persist_directory: str = "./chroma_db",
         collection_name: str = "ChunkLength-512",
         embedding_model_name: str = "Qwen/Qwen3-Embedding-0.6B",
-        sqlite_db_path: str = "protocols.db"
+        sqlite_db_path: str = "protocols.db",
+        use_reranker: bool = True,
+        reranker_model_name: str = "Qwen/Qwen3-Reranker-0.6B",
     ):
         """
         Initialize the protocol searcher.
@@ -136,10 +138,22 @@ class ProtocolSearcher:
         self.chroma_persist_directory = chroma_persist_directory
         self.collection_name = collection_name
         self.sqlite_db_path = sqlite_db_path
+        self.use_reranker = use_reranker
+        self.reranker_model_name = reranker_model_name
         
         # Initialize embedding function
         self.embedding_function = ProtocolEmbeddingFunction(embedding_model_name)
-        self.reranker = ProtocolReranker()
+        self.reranker = None
+        if self.use_reranker:
+            try:
+                self.reranker = ProtocolReranker(model_name=self.reranker_model_name)
+            except Exception as e:
+                logger.warning(
+                    "Failed to initialize reranker '%s': %s. Using base similarity ranking.",
+                    self.reranker_model_name,
+                    e,
+                )
+                self.reranker = None
         
         # Initialize ChromaDB client
         self.client = chromadb.PersistentClient(path=chroma_persist_directory)
@@ -226,12 +240,30 @@ class ProtocolSearcher:
         if not initial_results['ids'][0]:
             return []
 
-        # Step 2: Deep reranking with Cross-Encoder
-        reranked_chunks = self.reranker.rerank(
-            query_text=query, 
-            initial_results=initial_results, 
-            top_k=top_k_chunks # Rerank all of them to find the true best
-        )
+        # Step 2: Deep reranking with Cross-Encoder (or fallback to base similarity)
+        if self.reranker is not None:
+            reranked_chunks = self.reranker.rerank(
+                query_text=query, 
+                initial_results=initial_results, 
+                top_k=top_k_chunks # Rerank all of them to find the true best
+            )
+        else:
+            reranked_chunks = []
+            for doc_id, doc, metadata, distance in zip(
+                initial_results.get("ids", [[]])[0],
+                initial_results.get("documents", [[]])[0],
+                initial_results.get("metadatas", [[]])[0],
+                initial_results.get("distances", [[]])[0],
+            ):
+                reranked_chunks.append(
+                    {
+                        "id": doc_id,
+                        "document": doc,
+                        "metadata": metadata,
+                        "rerank_score": 1.0 - float(distance),
+                        "original_distance": distance,
+                    }
+                )
 
         # Step 3: Max Pooling (Get the highest scoring chunk per protocol_id)
         protocol_dict = {}
