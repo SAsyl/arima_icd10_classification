@@ -225,7 +225,8 @@ class AppSettings:
             llm_parallelism=max(1, _env_int("LLM_PARALLELISM", 2)),
             chroma_db_dir=os.getenv("CHROMA_DB_DIR", "./chroma_db"),
             chroma_collection=os.getenv("CHROMA_COLLECTION", "ChunkLength-512"),
-            embedding_model=os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B"),
+            # embedding_model=os.getenv("EMBEDDING_MODEL", "Qwen/Qwen3-Embedding-0.6B"),
+            embedding_model=os.getenv("EMBEDDING_MODEL", "./models/embedding"),
             enable_retrieval=_env_bool("ENABLE_RETRIEVAL", True),
             use_reranker=_env_bool("USE_RERANKER", False),
             top_k_chunks=max(3, _env_int("TOP_K_CHUNKS", 25)),
@@ -681,13 +682,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-frontend_dir = Path(__file__).parent.parent / "frontend"
-if frontend_dir.exists():
-    app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
+frontend_dir = "./src/frontend"
+# if frontend_dir.exists():
+app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
 
-    @app.get("/")
-    async def read_index():
-        return FileResponse(str(frontend_dir / "index.html"))
+@app.get("/")
+async def read_index():
+    return FileResponse(f"{frontend_dir}/index.html")
 
 
 @app.post("/diagnose", response_model=DiagnoseResponse)

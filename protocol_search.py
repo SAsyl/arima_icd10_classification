@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 class ProtocolReranker:
     """Custom reranking function for protocols using a cross-encoder."""
     
-    def __init__(self, model_name: str = "Qwen/Qwen3-Reranker-0.6B", max_length: int = 512):
+    def __init__(self, model_name: str = "models/reranker", max_length: int = 512):
         self.model_name = model_name
         self.max_length = max_length
         self.tokenizer = AutoTokenizer.from_pretrained(model_name, padding_side='left')
@@ -122,10 +122,10 @@ class ProtocolSearcher:
         self,
         chroma_persist_directory: str = "./chroma_db",
         collection_name: str = "ChunkLength-512",
-        embedding_model_name: str = "Qwen/Qwen3-Embedding-0.6B",
+        embedding_model_name: str = "models/embedding",
         sqlite_db_path: str = "protocols.db",
         use_reranker: bool = True,
-        reranker_model_name: str = "Qwen/Qwen3-Reranker-0.6B",
+        reranker_model_name: str = "models/reranker",
     ):
         """
         Initialize the protocol searcher.
@@ -764,8 +764,8 @@ Examples:
     
     parser.add_argument(
         "--embedding-model",
-        default="Qwen/Qwen3-Embedding-0.6B",
-        help="Name of the embedding model (default: Qwen/Qwen3-Embedding-0.6B)"
+        default="models/embedding",
+        help="Name of the embedding model (default: embedding_model)"
     )
 
     parser.add_argument(

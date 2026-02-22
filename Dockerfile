@@ -8,6 +8,10 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev
 
 COPY src/ ./src/
+COPY parse_protocols.py ./parse_protocols.py
+COPY protocol_search.py ./protocol_search.py
+
+COPY protocols.db ./protocols.db
 
 ENV PYTHONUNBUFFERED=1
 

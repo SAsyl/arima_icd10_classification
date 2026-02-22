@@ -33,16 +33,16 @@ logger = logging.getLogger(__name__)
 class ProtocolEmbeddingFunction(embedding_functions.EmbeddingFunction):
     """Custom embedding function for protocols using transformers."""
     
-    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B", chunk_size: int = 512):
+    def __init__(self, model_name: str = "./models/embedding", chunk_size: int = 512):
         self.model_name = model_name
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, local_files_only=True, trust_remote_code=True)
         
         # Try to load on GPU first, fallback to CPU if out of memory
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.max_tokens = chunk_size
         
         try:
-            self.model = AutoModel.from_pretrained(model_name)
+            self.model = AutoModel.from_pretrained(model_name, local_files_only=True, trust_remote_code=True)
             if self.device == "cuda":
                 try:
                     self.model.to(self.device)
@@ -101,7 +101,7 @@ class ProtocolProcessor:
         self,
         chroma_persist_directory: str = "./chroma_db",
         collection_name: str = "ChunkLength-512",
-        embedding_model_name: str = "Qwen/Qwen3-Embedding-0.6B",
+        embedding_model_name: str = "models/embedding",
         chunk_size: int = 512,
         chunk_overlap: int = 200
     ):
@@ -465,8 +465,8 @@ Examples:
     
     parser.add_argument(
         "--embedding-model",
-        default="Qwen/Qwen3-Embedding-0.6B",
-        help="Name of embedding model (default: Qwen/Qwen3-Embedding-0.6B)"
+        default="models/embedding",
+        help="Name of embedding model (default: embedding_model)"
     )
     
     args = parser.parse_args()

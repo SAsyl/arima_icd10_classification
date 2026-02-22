@@ -224,7 +224,12 @@ chroma_db/
 test*
 TaskQazCode
 *.db
+data/evals/
 
 # Readme files
 *.md
 !README.md
+
+# Models
+embedding_model/
+reranker_model/
