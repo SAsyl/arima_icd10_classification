@@ -60,6 +60,9 @@ git clone https://github.com/SAsyl/arima_icd10_classification.git
 cd arima_icd10_classification
 ```
 
+### 1.5. Download databases
+Download `protocols.db` and `chroma_db_ChunkLength512.zip` from [google cloud](https://drive.google.com/drive/folders/1gRwOzDo0o8AN3mx61A3FM0GRFx8LJX_j). Paste `protocols.db` into `arima_icd10_classification` folder and unzip ChromaDB zip file in the same directory.
+
 ### 2. Set up the environment
 Make sure that `uv` is installed. Refer to [uv documentation](https://docs.astral.sh/uv/getting-started/installation/)
 
@@ -93,7 +96,7 @@ Load models, build and run docker
 uv run load_model.py
 
 docker build -t submission .
-docker run -p 8000:8000 --env-file ./app.env -v ./models/:/app/models/ -v ./chroma_db:/app/chroma_db/ submission
+docker run -p 8000:8000 --env-file ./app.env  --gpus all -v ./models/:/app/models/ -v ./chroma_db:/app/chroma_db/ submission
 
 ```
 Then run the validation as shown above. 
