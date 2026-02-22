@@ -13,9 +13,13 @@ Runs on http://127.0.0.1:8000/diagnose
 
 import random
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 
@@ -33,6 +37,26 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Mock Diagnostic Server", lifespan=lifespan)
+
+# Add CORS middleware to allow cross-origin requests
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
+
+# Get the frontend directory path
+frontend_dir = Path(__file__).parent.parent / "frontend"
+
+# Mount static files
+app.mount("/static", StaticFiles(directory=str(frontend_dir)), name="static")
+
+@app.get("/")
+async def read_index():
+    """Serve the main frontend page."""
+    return FileResponse(str(frontend_dir / "index.html"))
 
 ICD_CODES = [
     "A00.13",
