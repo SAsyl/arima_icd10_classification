@@ -20,6 +20,7 @@ from transformers import AutoTokenizer, AutoModel
 import chromadb
 from chromadb.config import Settings
 from chromadb.utils import embedding_functions
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 # Set up logging
 logging.basicConfig(
@@ -32,12 +33,13 @@ logger = logging.getLogger(__name__)
 class ProtocolEmbeddingFunction(embedding_functions.EmbeddingFunction):
     """Custom embedding function for protocols using transformers."""
     
-    def __init__(self, model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"):
+    def __init__(self, model_name: str = "Qwen/Qwen3-Embedding-0.6B", chunk_size: int = 512):
         self.model_name = model_name
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         
         # Try to load on GPU first, fallback to CPU if out of memory
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.max_tokens = chunk_size
         
         try:
             self.model = AutoModel.from_pretrained(model_name)
@@ -68,10 +70,10 @@ class ProtocolEmbeddingFunction(embedding_functions.EmbeddingFunction):
             
             # Tokenize and generate embeddings
             encoded_input = self.tokenizer(
-                batch_texts, 
-                padding=True, 
-                truncation=True, 
-                max_length=512,
+                batch_texts,
+                padding=True,
+                truncation=False,
+                max_length=self.max_tokens,
                 return_tensors="pt"
             ).to(self.device)
             
@@ -98,9 +100,9 @@ class ProtocolProcessor:
     def __init__(
         self,
         chroma_persist_directory: str = "./chroma_db",
-        collection_name: str = "medical_protocols",
-        embedding_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-        chunk_size: int = 8000,
+        collection_name: str = "ChunkLength-512",
+        embedding_model_name: str = "Qwen/Qwen3-Embedding-0.6B",
+        chunk_size: int = 512,
         chunk_overlap: int = 200
     ):
         """
@@ -119,7 +121,7 @@ class ProtocolProcessor:
         self.chunk_overlap = chunk_overlap
         
         # Initialize embedding function
-        self.embedding_function = ProtocolEmbeddingFunction(embedding_model_name)
+        self.embedding_function = ProtocolEmbeddingFunction(embedding_model_name, chunk_size)
         
         # Initialize text splitter
         self.text_splitter = self._create_text_splitter()
@@ -136,9 +138,7 @@ class ProtocolProcessor:
     
     def _create_text_splitter(self):
         """Create text splitter with proper token counting."""
-        try:
-            from langchain_text_splitters import RecursiveCharacterTextSplitter
-            
+        try:            
             def token_length_function(text: str) -> int:
                 # Try different parameter names for different tokenizer versions
                 try:
@@ -429,7 +429,6 @@ def main():
 Examples:
   python protocol_processor_fixed.py TaskQazCode/protocols_corpus.jsonl
   python protocol_processor_fixed.py TaskQazCode/protocols_corpus.jsonl --chunk-size 4000
-  python protocol_processor_fixed.py TaskQazCode/protocols_corpus.jsonl --db-dir ./my_chroma_db
         """
     )
     
@@ -441,8 +440,8 @@ Examples:
     parser.add_argument(
         "--chunk-size",
         type=int,
-        default=8000,
-        help="Target chunk size in tokens (default: 8000)"
+        default=512,
+        help="Target chunk size in tokens (default: 512)"
     )
     
     parser.add_argument(
@@ -460,14 +459,14 @@ Examples:
     
     parser.add_argument(
         "--collection-name",
-        default="medical_protocols",
-        help="Name of ChromaDB collection (default: medical_protocols)"
+        default="ChunkLength-512",
+        help="Name of ChromaDB collection (default: ChunkLength-512)"
     )
     
     parser.add_argument(
         "--embedding-model",
-        default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-        help="Name of embedding model (default: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2)"
+        default="Qwen/Qwen3-Embedding-0.6B",
+        help="Name of embedding model (default: Qwen/Qwen3-Embedding-0.6B)"
     )
     
     args = parser.parse_args()

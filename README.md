@@ -43,9 +43,9 @@ Working demo interface: user inputs symptoms → system returns diagnoses with I
 
 ### Run scripts
 ```bash
-python parse_protocols.py TaskQazCode/protocols_corpus.jsonl --embedding-model "Qwen/Qwen3-Embedding-0.6B"
+python parse_protocols.py TaskQazCode/protocols_corpus.jsonl --collection-name ChunkLength-256 --chunk-size 256
 
-python protocol_search.py --embedding-model "Qwen/Qwen3-Embedding-0.6B" "Головная боль, насморк и постоянный кашель"
+python protocol_search.py "Головная боль, насморк и постоянный кашель"
 ```
 
 <!-- ---

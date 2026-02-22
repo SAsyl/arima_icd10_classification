@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 class ProtocolReranker:
     """Custom reranking function for protocols using a cross-encoder."""
     
-    def __init__(self, model_name: str = "Qwen/Qwen3-Reranker-0.6B", max_length: int = 2048):
+    def __init__(self, model_name: str = "Qwen/Qwen3-Reranker-0.6B", max_length: int = 512):
         self.model_name = model_name
         self.max_length = max_length
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -146,8 +146,8 @@ class ProtocolSearcher:
     def __init__(
         self,
         chroma_persist_directory: str = "./chroma_db",
-        collection_name: str = "medical_protocols",
-        embedding_model_name: str = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+        collection_name: str = "ChunkLength-512",
+        embedding_model_name: str = "Qwen/Qwen3-Embedding-0.6B",
         sqlite_db_path: str = "protocols.db"
     ):
         """
@@ -394,6 +394,166 @@ class ProtocolSearcher:
             logger.error(f"Failed to list protocols: {e}")
             return []
     
+    def describe_database_structure(self) -> Dict[str, Any]:
+        """
+        Describe the structure of the ChromaDB database, including all collections.
+        
+        Returns:
+            Dictionary containing database structure information
+        """
+        logger.info("Describing ChromaDB database structure")
+        
+        try:
+            # Get all collections in the database
+            collections = self.client.list_collections()
+            
+            db_structure = {
+                "database_path": self.chroma_persist_directory,
+                "total_collections": len(collections),
+                "collections": []
+            }
+            
+            for collection in collections:
+                collection_info = {
+                    "name": collection.name,
+                    "id": collection.id,
+                    "metadata": collection.metadata
+                }
+                
+                # Get collection statistics
+                try:
+                    # Get count of items in collection
+                    collection_count = collection.count()
+                    collection_info["item_count"] = collection_count
+                    
+                    # Get a sample of items to understand the structure
+                    if collection_count > 0:
+                        sample_items = collection.get(limit=5, include=['metadatas', 'documents'])
+                        
+                        # Analyze metadata structure
+                        metadata_keys = set()
+                        for metadata in sample_items['metadatas']:
+                            if metadata:
+                                metadata_keys.update(metadata.keys())
+                        
+                        collection_info["metadata_fields"] = list(metadata_keys)
+                        
+                        # Get document statistics
+                        if sample_items['documents']:
+                            doc_lengths = [len(doc) for doc in sample_items['documents'] if doc]
+                            if doc_lengths:
+                                collection_info["document_stats"] = {
+                                    "sample_count": len(doc_lengths),
+                                    "min_length": min(doc_lengths),
+                                    "max_length": max(doc_lengths),
+                                    "avg_length": sum(doc_lengths) / len(doc_lengths)
+                                }
+                        
+                        # Check for embedding function
+                        if hasattr(collection, '_embedding_function'):
+                            collection_info["has_embedding_function"] = True
+                        else:
+                            collection_info["has_embedding_function"] = False
+                            
+                    else:
+                        collection_info["item_count"] = 0
+                        collection_info["metadata_fields"] = []
+                        collection_info["has_embedding_function"] = False
+                        
+                except Exception as e:
+                    logger.warning(f"Error getting details for collection {collection.name}: {e}")
+                    collection_info["error"] = str(e)
+                
+                db_structure["collections"].append(collection_info)
+            
+            logger.info(f"Database contains {len(collections)} collections")
+            return db_structure
+            
+        except Exception as e:
+            logger.error(f"Failed to describe database structure: {e}")
+            return {
+                "database_path": self.chroma_persist_directory,
+                "error": str(e),
+                "collections": []
+            }
+    
+    def delete_collection(self, collection_name: str) -> bool:
+        """
+        Delete a collection from the ChromaDB database.
+        
+        Args:
+            collection_name: Name of the collection to delete
+            
+        Returns:
+            True if deletion was successful, False otherwise
+        """
+        logger.info(f"Attempting to delete collection: {collection_name}")
+        
+        try:
+            # Check if collection exists
+            collections = self.client.list_collections()
+            collection_exists = any(c.name == collection_name for c in collections)
+            
+            if not collection_exists:
+                logger.warning(f"Collection '{collection_name}' does not exist")
+                return False
+            
+            # Delete the collection
+            self.client.delete_collection(name=collection_name)
+            logger.info(f"Successfully deleted collection: {collection_name}")
+            
+            # If we deleted the current collection, set it to None
+            if self.collection_name == collection_name:
+                self.collection = None
+                logger.warning(f"Current collection '{collection_name}' was deleted. Please reconnect to a different collection.")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to delete collection '{collection_name}': {e}")
+            return False
+    
+    def print_database_structure(self, db_structure: Dict[str, Any]) -> None:
+        """
+        Print the database structure in a readable format.
+        
+        Args:
+            db_structure: Database structure information from describe_database_structure
+        """
+        print(f"\n{'='*80}")
+        print("CHROMADB DATABASE STRUCTURE")
+        print(f"{'='*80}")
+        print(f"Database Path: {db_structure['database_path']}")
+        print(f"Total Collections: {db_structure['total_collections']}")
+        
+        if 'error' in db_structure:
+            print(f"Error: {db_structure['error']}")
+            return
+        
+        for i, collection in enumerate(db_structure['collections'], 1):
+            print(f"\n{'-'*60}")
+            print(f"COLLECTION {i}: {collection['name']}")
+            print(f"{'-'*60}")
+            print(f"ID: {collection['id']}")
+            print(f"Item Count: {collection.get('item_count', 'N/A')}")
+            print(f"Has Embedding Function: {collection.get('has_embedding_function', 'N/A')}")
+            
+            if collection.get('metadata'):
+                print(f"Collection Metadata: {collection['metadata']}")
+            
+            if collection.get('metadata_fields'):
+                print(f"Metadata Fields: {', '.join(collection['metadata_fields'])}")
+            
+            if collection.get('document_stats'):
+                stats = collection['document_stats']
+                print(f"Document Statistics (sample of {stats['sample_count']} items):")
+                print(f"  - Min Length: {stats['min_length']} characters")
+                print(f"  - Max Length: {stats['max_length']} characters")
+                print(f"  - Avg Length: {stats['avg_length']:.1f} characters")
+            
+            if 'error' in collection:
+                print(f"Error: {collection['error']}")
+    
     def print_search_results(self, results: Dict[str, Any], query: str) -> None:
         """
         Print search results in a readable format.
@@ -484,6 +644,12 @@ Examples:
   # List all protocols
   python protocol_search.py --list-protocols
   
+  # Describe database structure
+  python protocol_search.py --describe-db
+  
+  # Delete a collection
+  python protocol_search.py --delete-collection MyCollection
+  
   # Search with custom database settings
   python protocol_search.py "pregnancy" --db-dir ./my_db --collection-name my_protocols
         """
@@ -492,7 +658,7 @@ Examples:
     parser.add_argument(
         "query",
         nargs='?',
-        help="Search query text (not required for --get-protocol or --list-protocols)"
+        help="Search query text (not required for --get-protocol, --list-protocols, --describe-db, or --delete-collection)"
     )
     
     parser.add_argument(
@@ -519,6 +685,17 @@ Examples:
     )
     
     parser.add_argument(
+        "--describe-db",
+        action="store_true",
+        help="Describe the structure of the ChromaDB database"
+    )
+    
+    parser.add_argument(
+        "--delete-collection",
+        help="Delete a collection from the database"
+    )
+    
+    parser.add_argument(
         "--db-dir",
         default="./chroma_db",
         help="Directory where ChromaDB is persisted (default: ./chroma_db)"
@@ -526,14 +703,14 @@ Examples:
     
     parser.add_argument(
         "--collection-name",
-        default="medical_protocols",
-        help="Name of the ChromaDB collection (default: medical_protocols)"
+        default="ChunkLength-512",
+        help="Name of the ChromaDB collection (default: ChunkLength-512)"
     )
     
     parser.add_argument(
         "--embedding-model",
-        default="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
-        help="Name of the embedding model (default: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2)"
+        default="Qwen/Qwen3-Embedding-0.6B",
+        help="Name of the embedding model (default: Qwen/Qwen3-Embedding-0.6B)"
     )
 
     parser.add_argument(
@@ -555,7 +732,18 @@ Examples:
     searcher.index_full_protocols_to_sqlite("TaskQazCode/protocols_corpus.jsonl")
 
     # Handle different operations
-    if args.list_protocols:
+    if args.describe_db:
+        db_structure = searcher.describe_database_structure()
+        searcher.print_database_structure(db_structure)
+    
+    elif args.delete_collection:
+        success = searcher.delete_collection(args.delete_collection)
+        if success:
+            print(f"Successfully deleted collection: {args.delete_collection}")
+        else:
+            print(f"Failed to delete collection: {args.delete_collection}")
+    
+    elif args.list_protocols:
         protocols = searcher.list_protocols()
         print(f"\nFound {len(protocols)} protocols:")
         for i, protocol_id in enumerate(protocols, 1):
@@ -588,7 +776,7 @@ Examples:
     
     else:
         parser.print_help()
-        print("\nError: Please provide a search query or use --list-protocols or --get-protocol")
+        print("\nError: Please provide a search query or use --list-protocols, --get-protocol, --describe-db, or --delete-collection")
 
 
 if __name__ == "__main__":
